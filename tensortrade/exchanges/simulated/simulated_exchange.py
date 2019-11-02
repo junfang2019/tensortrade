@@ -57,10 +57,16 @@ class SimulatedExchange(InstrumentExchange):
 
         self.data_frame = data_frame
 
-        max_allowed_slippage_percent = kwargs.get('max_allowed_slippage_percent', 1.0)
+        self._max_price_slippage_percent = kwargs.get('max_allowed_slippage_percent', 1.0)
+        self._max_amount_slippage_percent = kwargs.get('max_allowed_slippage_percent', 0.0)
 
         SlippageModelClass = kwargs.get('slippage_model', RandomUniformSlippageModel)
-        self._slippage_model = SlippageModelClass(max_allowed_slippage_percent)
+        self._price_slip_model = SlippageModelClass(min=self._min_trade_price,
+                                                    max=self._max_trade_price,
+                                                    slip=self._max_price_slippage_percent)
+        self._amount_slip_model = SlippageModelClass(min=self._min_trade_amount,
+                                                    max=self._max_trade_amount,
+                                                    slip=self._max_amount_slippage_percent)
 
     @property
     def data_frame(self) -> pd.DataFrame:
@@ -152,67 +158,113 @@ class SimulatedExchange(InstrumentExchange):
     def current_price(self, symbol: str) -> float:
         if self._price_history is not None:
             return float(self._price_history.iloc[self._current_step])
-
         return 0
 
     def _is_valid_trade(self, trade: Trade) -> bool:
-        if trade.trade_type is TradeType.MARKET_BUY or trade.trade_type is TradeType.LIMIT_BUY:
-            return trade.amount >= self._min_order_amount and self._balance >= trade.amount * trade.price
-        elif trade.trade_type is TradeType.MARKET_SELL or trade.trade_type is TradeType.LIMIT_SELL:
-            return trade.amount >= self._min_order_amount and self._portfolio.get(trade.symbol, 0) >= trade.amount
+        # print('_is_valid_trade')
+        if trade.valid:
+            return True
 
-        return True
+        if trade.is_hold:
+            return trade.transact_amount <= self.portfolio.get(trade.symbol, 0)
+        elif trade.is_buy:
+            return trade.transact_amount >= self._min_order_amount and self.balance >= trade.transact_total
+        elif trade.is_sell:
+            return trade.transact_amount >= self._min_order_amount and self.portfolio.get(trade.symbol, 0) >= trade.transact_amount
+
+        return False
 
     def _update_account(self, trade: Trade):
-        if self._is_valid_trade(trade) and not trade.is_hold:
-            self._trades = self._trades.append({
-                'step': self._current_step,
-                'symbol': trade.symbol,
-                'type': trade.trade_type,
-                'amount': trade.amount,
-                'price': trade.price
-            }, ignore_index=True)
-
+        # print('update')
+        log = {'step': self._current_step}
         if trade.is_buy:
-            self._balance -= trade.amount * trade.price
-            self._portfolio[trade.symbol] = self._portfolio.get(trade.symbol, 0) + trade.amount
+            log['action'] = trade.log
+            self._balance -= trade.transact_total
+            self._portfolio[trade.symbol] = self._portfolio.get(trade.symbol, 0) + trade.transact_amount
         elif trade.is_sell:
-            self._balance += trade.amount * trade.price
-            self._portfolio[trade.symbol] = self._portfolio.get(trade.symbol, 0) - trade.amount
+            log['action'] = trade.log
+            self._balance += trade.transact_total
+            self._portfolio[trade.symbol] = self._portfolio.get(trade.symbol, 0) - trade.transact_amount
+        elif trade.is_hold:
+            log['action'] = trade.log
+        else:
+            log['action'] = "Unknown Trade Type: {}".format(trade.to_dict)
+
+        if self._is_valid_trade(trade) and not trade.is_hold:
+            self._trades = self._trades.append({'step': self._current_step,
+                                                'symbol': trade.symbol,
+                                                'type': trade.trade_type,
+                                                'amount': trade.transact_amount,
+                                                'price': trade.transact_total}, ignore_index=True)
 
         self._portfolio[self._base_instrument] = self._balance
 
-        self._performance = self._performance.append({
-            'balance': self.balance,
-            'net_worth': self.net_worth,
-        }, ignore_index=True)
+        log.update({'balance': self.balance,
+                    'net_worth': self.net_worth
+                    })
+        # print(log['action'])
+        # print(self.balance, self.net_worth)
+        self._performance = self._performance.append( log , ignore_index=True)
 
     def execute_trade(self, trade: Trade) -> Trade:
-        current_price = self.current_price(symbol=trade.symbol)
-        commission = self._commission_percent / 100
-        filled_trade = trade.copy()
+        # print('execute')
+        trade = trade.copy()
+        transact_amount = trade.order_amount
+        transact_price = trade.order_price
 
-        if filled_trade.is_hold or not self._is_valid_trade(filled_trade):
-            filled_trade.amount = 0
+        if trade.is_hold:
+            # hodl boyz!
+            trade.transact_amount = transact_amount
+            trade.transact_price = transact_price
+        else:
+            trade.order_commission = transact_price * self.commission_percent
 
-            return filled_trade
+        if trade.is_buy:
+            if trade.is_limit_buy:
+                # our buying power will fluxuate slightly as the market moves
+                slip_adjusted_amount = (self.balance * (1-(self._max_amount_slippage_percent/100)) * transact_amount) / transact_price
+                transact_amount = self._amount_slip_model.random_slip(slip_adjusted_amount)
+            elif trade.is_market_buy:
+                # the price can fluxuate up or down during the market buy order
+                transact_price = self._price_slip_model.random_slip(transact_price)
+            else:
+                # catch all
+                transact_price = self._bind_trade_price(transact_price)
+                transact_amount = self._bind_trade_amount(transact_amount)
 
-        if filled_trade.is_buy:
-            price_adjustment = price_adjustment = (1 + commission)
-            filled_trade.price = max(round(current_price * price_adjustment,
-                                           self._base_precision), self.base_precision)
-            filled_trade.amount = round(
-                (filled_trade.price * filled_trade.amount) / filled_trade.price, self._instrument_precision)
-        elif filled_trade.is_sell:
-            price_adjustment = (1 - commission)
-            filled_trade.price = round(current_price * price_adjustment, self._base_precision)
-            filled_trade.amount = round(filled_trade.amount, self._instrument_precision)
+        elif trade.is_sell:
+            if trade.is_limit_sell:
+                # if we're selling we can only sell LESS than we have on hand.
+                amount = self._amount_slip_model.slip_down(transact_amount)
+            elif trade.is_market_sell:
+                # sell price can fluxuate up or down during a market sale order
+                transact_price = self._price_slip_model.random_slip(transact_price)
+            else:
+                # catch all
+                transact_price = self._bind_trade_price(transact_price)
+                transact_amount = self._bind_trade_amount(transact_amount)
 
-        filled_trade = self._slippage_model.fill_order(filled_trade, current_price)
 
-        self._update_account(filled_trade)
+        # save all the
+        trade.transact_price = round(transact_price, self._base_precision)
+        trade.transact_amount = round(transact_amount, self._instrument_precision)
+        trade.transact_commission = round((transact_price*transact_amount) * (self.commission_percent), self._base_precision)
+        trade.transact_commission_percent=self.commission_percent
+        trade.transact_total = round((transact_price * transact_amount) * (1 + self.commission_percent), self._base_precision)
 
-        return filled_trade
+        if self._is_valid_trade(trade):
+            trade.valid = True
+
+            if not trade.is_hold:
+                trade.executed = True
+
+            # print('Valid',self.balance, trade.to_dict)
+            self._update_account(trade)
+        else:
+            trade.valid = False
+            trade.executed = False
+            # print("Invalid trade", self.balance, trade.to_dict)
+        return trade
 
     def reset(self):
         super().reset()
@@ -221,4 +273,4 @@ class SimulatedExchange(InstrumentExchange):
         self._balance = self.initial_balance
         self._portfolio = {self.base_instrument: self.balance}
         self._trades = pd.DataFrame([], columns=['step', 'symbol', 'type', 'amount', 'price'])
-        self._performance = pd.DataFrame([], columns=['balance', 'net_worth'])
+        self._performance = pd.DataFrame([], columns=['balance', 'net_worth', 'action', 'step'])

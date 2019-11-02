@@ -28,13 +28,11 @@ class DiscreteActionStrategy(ActionStrategy):
         Arguments:
             n_actions: The number of bins to divide the total balance by. Defaults to 20 (i.e. 1/20, 2/20, ..., 20/20).
             instrument_symbol: The exchange symbol of the instrument being traded. Defaults to 'BTC'.
-            max_allowed_slippage: The maximum amount above the current price the strategy will pay for an instrument. Defaults to 1.0 (i.e. 1%).
         """
         super().__init__(action_space=Discrete(n_actions), dtype=np.int64)
 
         self.n_actions = n_actions
         self.instrument_symbol = instrument_symbol
-        self.max_allowed_slippage_percent = max_allowed_slippage_percent
 
     @property
     def dtype(self) -> DTypeString:
@@ -46,32 +44,29 @@ class DiscreteActionStrategy(ActionStrategy):
         raise ValueError(
             'Cannot change the dtype of a `SimpleDiscreteStrategy` due to the requirements of `gym.spaces.Discrete` spaces. ')
 
+    def trade_type(self, action:TradeActionUnion) -> TradeType:
+        n_splits = self.n_actions / len(TradeType)
+        return TradeType(action % len(TradeType))
+
     def get_trade(self, action: TradeActionUnion) -> Trade:
         """The trade type is determined by `action % len(TradeType)`, and the trade amount is determined by the multiplicity of the action.
 
-        For example, 1 = LIMIT_BUY|0.25, 2 = MARKET_BUY|0.25, 6 = LIMIT_BUY|0.5, 7 = MARKET_BUY|0.5, etc.
+        For example, 1 = LIMIT_BUY|0.25, 2 = MARKET_BUY|0.25, 6 = LIMIT_BUY|0.5, 7 = MARKE
+        T_BUY|0.5, etc.
         """
-        n_splits = self.n_actions / len(TradeType)
-        trade_type = TradeType(action % len(TradeType))
-        trade_amount = int(action / len(TradeType)) * float(1 / n_splits) + (1 / n_splits)
+        trade_type = self.get_trade_type(action)
 
-        current_price = self._exchange.current_price(symbol=self.instrument_symbol)
+        trade_amount = int(action / len(TradeType)) * float(1 / n_splits) + (1 / n_splits)
         base_precision = self._exchange.base_precision
         instrument_precision = self._exchange.instrument_precision
 
-        amount = self._exchange.instrument_balance(self.instrument_symbol)
-        price = current_price
+        amount_held = self._exchange.instrument_balance(self.instrument_symbol)
+        current_price = self._exchange.current_price(symbol=self.instrument_symbol)
 
-        if trade_type is TradeType.MARKET_BUY or trade_type is TradeType.LIMIT_BUY:
-            price_adjustment = 1 + (self.max_allowed_slippage_percent / 100)
-            price = max(round(current_price * price_adjustment, base_precision), base_precision)
-            amount = round(self._exchange.balance * 0.99 *
-                           trade_amount / price, instrument_precision)
 
-        elif trade_type is TradeType.MARKET_SELL or trade_type is TradeType.LIMIT_SELL:
-            price_adjustment = 1 - (self.max_allowed_slippage_percent / 100)
-            price = round(current_price * price_adjustment, base_precision)
-            amount_held = self._exchange.portfolio.get(self.instrument_symbol, 0)
-            amount = round(amount_held * trade_amount, instrument_precision)
+        if trade_type.is_buy:
+            trade_amount = round(self._exchange.balance * 0.98 * trade_amount / current_price, instrument_precision)
+        elif trade_type.is_sell:
+            trade_amount = round(amount_held * trade_amount, instrument_precision)
 
-        return Trade(self.instrument_symbol, trade_type, amount, price)
+        return Trade(self.instrument_symbol, trade_type, trade_amount, current_price)

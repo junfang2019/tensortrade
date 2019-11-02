@@ -120,12 +120,11 @@ class TradingEnvironment(gym.Env):
             A tuple containing the (fill_amount, fill_price) of the executed trade.
         """
         executed_trade = self._action_strategy.get_trade(action=action)
-
         filled_trade = self._exchange.execute_trade(executed_trade)
 
         return executed_trade, filled_trade
 
-    def _next_observation(self, trade: Trade) -> np.ndarray:
+    def _next_observation(self) -> np.ndarray:
         """Returns the next observation from the exchange.
 
         Returns:
@@ -187,8 +186,7 @@ class TradingEnvironment(gym.Env):
             info (dict): Any auxiliary, diagnostic, or debugging information to output.
         """
         executed_trade, filled_trade = self._take_action(action)
-
-        observation = self._next_observation(filled_trade)
+        observation = self._next_observation()
         reward = self._get_reward(filled_trade)
         done = self._done()
         info = self._info(executed_trade, filled_trade)
@@ -207,7 +205,7 @@ class TradingEnvironment(gym.Env):
         self._reward_strategy.reset()
         self._exchange.reset()
 
-        return self._next_observation(Trade('N/A', 'hold', 0, 0))
+        return self._next_observation()
 
     def render(self, mode='none'):
         """Renders the environment."""
