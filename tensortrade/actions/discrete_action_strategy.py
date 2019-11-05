@@ -44,9 +44,22 @@ class DiscreteActionStrategy(ActionStrategy):
         raise ValueError(
             'Cannot change the dtype of a `SimpleDiscreteStrategy` due to the requirements of `gym.spaces.Discrete` spaces. ')
 
-    def trade_type(self, action:TradeActionUnion) -> TradeType:
-        n_splits = self.n_actions / len(TradeType)
+    @property
+    def n_splits(self) -> int:
+        return self.n_actions / len(TradeType)
+
+    def _get_trade_type(self, action:TradeActionUnion) -> TradeType:
+        """calculates the trade type based off of the action value passed
+        params:
+            action: the action between the range of the n_actions
+        returns:
+            TradeType
+        """
         return TradeType(action % len(TradeType))
+
+    def _get_trade_amount(self, action:TradeActionUnion) -> float:
+        amount = int(action / len(TradeType)) * float(1 / self.n_splits) + (1 / self.n_splits)
+        return amount
 
     def get_trade(self, action: TradeActionUnion) -> Trade:
         """The trade type is determined by `action % len(TradeType)`, and the trade amount is determined by the multiplicity of the action.
@@ -54,18 +67,22 @@ class DiscreteActionStrategy(ActionStrategy):
         For example, 1 = LIMIT_BUY|0.25, 2 = MARKET_BUY|0.25, 6 = LIMIT_BUY|0.5, 7 = MARKE
         T_BUY|0.5, etc.
         """
-        trade_type = self.get_trade_type(action)
 
-        trade_amount = int(action / len(TradeType)) * float(1 / n_splits) + (1 / n_splits)
+        trade_type = self._get_trade_type(action)
+        trade_amount = self._get_trade_amount(action)
+
         base_precision = self._exchange.base_precision
         instrument_precision = self._exchange.instrument_precision
 
         amount_held = self._exchange.instrument_balance(self.instrument_symbol)
         current_price = self._exchange.current_price(symbol=self.instrument_symbol)
 
+        balance = self._exchange.balance
 
         if trade_type.is_buy:
-            trade_amount = round(self._exchange.balance * 0.98 * trade_amount / current_price, instrument_precision)
+            # as an aditional barrier to overflowing the balance,
+            # we reserve 2% of our total balance for unseen slip and comissions.
+            trade_amount = round(balance * 0.98 * trade_amount / current_price, instrument_precision)
         elif trade_type.is_sell:
             trade_amount = round(amount_held * trade_amount, instrument_precision)
 
