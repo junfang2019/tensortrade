@@ -9,9 +9,10 @@ python:
   - '3.6'
 
 install:
-  - pip install -e .[all-tests]
+  - pip install -e .[tests]
 
-script: pytest
+script:
+  - pytest
 
 notifications:
   webhooks:
